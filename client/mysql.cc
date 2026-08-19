@@ -278,6 +278,8 @@ unsigned short terminal_width= 80;
 #define PROXY_MODE 0xfe
 #endif
 static my_bool is_proxymode = 0;
+static my_bool opt_close_attr_obclient_ip = 0;
+static my_bool opt_close_attr_obclient_name = 0;
 
 static uint opt_protocol=0;
 static const char *opt_protocol_type= "";
@@ -372,7 +374,11 @@ static char obclient_login[MAX_BUFFER_SIZE] = { 0 };
 static char* get_login_sql_path();
 static void start_login_sql(MYSQL *mysql, String *buffer, const char *path);
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) char *login_info;
+#else
 extern char *login_info;
+#endif
 static char* get_login_info();
 
 #define IS_CMD_SLASH 1    //oracle /
@@ -398,6 +404,13 @@ static void print_error_sqlstr(String *buffer, char* topN);
 
 static void connect_mysql_tenant(String *buffer);
 static bool execute_cmd(String& buffer);
+
+static bool is_pl_sql_type = 0;  //Improve performance
+static my_bool is_in_tee = 0;
+static my_bool is_in_spool = 0;
+static int com_spool(String *str, char*);
+static void end_spool();
+static void init_spool(const char *file_name, int flag);
 
 /* A structure which contains information on the commands this program
    can understand. */
@@ -453,6 +466,7 @@ static COMMANDS commands[] = {
     "Switch to another charset. Might be needed for processing binlog with multi-byte charsets." , NULL},
   { "warnings", 'W', com_warnings,  0, "Show warnings after every statement." , NULL},
   { "nowarning", 'w', com_nowarnings, 0, "Don't show warnings after every statement." , NULL},
+  { "spool", 0, com_spool, 1, "spool file_name [create|append|replace|off|out]." , NULL},
   /* Get bash-like expansion for some commands */
   { "create table",     0, 0, 0, "", NULL},
   { "create database",  0, 0, 0, "", NULL},
@@ -1213,7 +1227,7 @@ static void fix_history(String *final_command);
 
 static COMMANDS *find_command(char *name);
 static COMMANDS *find_command(char cmd_name);
-static bool add_line(String &, char *, size_t line_length, char *, bool *, bool *is_pl_escape_sql, bool);
+static bool add_line(String &, char *, size_t line_length, char *, bool *, bool *is_pl_escape_sql, bool, bool* is_pl_sql_type);
 static void remove_cntrl(String &buffer);
 static void print_table_data(MYSQL_RES *result);
 static void print_table_data_html(MYSQL_RES *result);
@@ -1702,8 +1716,10 @@ int main(int argc,char *argv[])
   start_login_sql(&mysql, &glob_buffer, get_login_sql_path());
 
   status.exit_status= read_and_execute(!status.batch);
-  if (opt_outfile)
+  if (opt_outfile && is_in_tee)
     end_tee();
+  if (opt_outfile && is_in_spool)
+    end_spool();
   mysql_end(0);
 #ifndef _lint
   DBUG_RETURN(0);				// Keep compiler happy
@@ -1780,6 +1796,7 @@ static bool do_connect(MYSQL *mysql, const char *host, const char *user,
                        const char *password, const char *database, ulong flags)
 {
   bool is_success = 0;
+  my_bool close_attr_obclient_name = 1;
   if (opt_secure_auth)
     mysql_options(mysql, MYSQL_SECURE_AUTH, (char *) &opt_secure_auth);
 #if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
@@ -1813,6 +1830,12 @@ static bool do_connect(MYSQL *mysql, const char *host, const char *user,
   if (ob_proxy_user_str && ob_proxy_user_str[0]) {
     mysql_options(mysql, OB_OPT_PROXY_USER, ob_proxy_user_str);
   }
+  //close_attr_obclient_name
+  if (opt_close_attr_obclient_ip) {
+    mysql_options(mysql, OB_OPT_CLOSE_ATTR_OBCLIENT_IP, &opt_close_attr_obclient_ip);
+  }
+  mysql_options(mysql, OB_OPT_CLOSE_ATTR_OBCLIENT_NAME, &close_attr_obclient_name);
+
   if (mysql_real_connect(mysql, host, user, password, database, opt_mysql_port, opt_mysql_unix_port, flags)) {
     is_success = 1;
     current_host_success = my_strdup(host?host:"", MYF(MY_WME));
@@ -2147,7 +2170,9 @@ static struct my_option my_long_options[] =
   { "socket5_proxy", OPT_OB_SOCKET5_PROXY , "socket5 proxy. example --socket5_proxy [host],[port],[user],[pwd]",
     &ob_socket5_proxy_str, &ob_socket5_proxy_str,0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0 },
   { "error-sql", OPT_OB_ERROR_SQL, "--error-sql topN",
-     &ob_error_top_str, &ob_error_top_str,0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0 },
+    &ob_error_top_str, &ob_error_top_str,0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0 },
+  { "close-ip", OPT_OB_CLOSE_OBCLIENT_IP, "close obclient attr ip", &opt_close_attr_obclient_ip,
+    &opt_close_attr_obclient_ip, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0 },
   { 0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
 
@@ -2572,8 +2597,10 @@ static int read_and_execute(bool interactive)
     }
 
     //support oracle mode command
-    if (last_session_mode && !ml_comment && !in_string && !is_pl_escape_sql) {
-      int ret = run_oracle_command(&glob_buffer, line);
+    if (last_session_mode && !ml_comment && !in_string && !is_pl_escape_sql && !is_pl_sql_type) {
+      int ret = 0;
+      is_pl_sql_type = is_oracle_pl_escape_sql(glob_buffer.c_ptr_safe(), glob_buffer.length());
+      ret = run_oracle_command(&glob_buffer, line);
       if (CMD_STATE_RUNED == ret) {
         continue;
       } else if (CMD_STATE_ERROR == ret) {
@@ -2600,7 +2627,7 @@ static int read_and_execute(bool interactive)
       continue;
     }
     if (add_line(glob_buffer, line, line_length, &in_string, &ml_comment, &is_pl_escape_sql,
-                 status.line_buff ? status.line_buff->truncated : 0))
+                 status.line_buff ? status.line_buff->truncated : 0, &is_pl_sql_type))
       break;
   }
   /* if in batch mode, send last query even if it doesn't end with \g or go */
@@ -2764,7 +2791,7 @@ static COMMANDS *find_command(char *name)
 }
 
 static bool add_line(String &buffer, char *line, size_t line_length,
-  char *in_string, bool *ml_comment, bool *is_pl_escape_sql, bool truncated)
+  char *in_string, bool *ml_comment, bool *is_pl_escape_sql, bool truncated, bool *is_pl_sql_type)
 {
   uchar inchar;
   char buff[80], *pos, *out;
@@ -2808,6 +2835,7 @@ static bool add_line(String &buffer, char *line, size_t line_length,
         *in_string = 0;
         *ml_comment = 0;
         *is_pl_escape_sql = 0;
+        *is_pl_sql_type = 0;
         return 0;
       } else if (buffer.is_empty() && (is_slash || slash_cnt > 1)) {
         if (!last_execute_buffer.is_empty()) {
@@ -2816,6 +2844,7 @@ static bool add_line(String &buffer, char *line, size_t line_length,
           *in_string = 0;
           *ml_comment = 0;
           *is_pl_escape_sql = 0;
+          *is_pl_sql_type = 0;
         } else {
           put_info("SP2-0103: Nothing in SQL buffer to run.", INFO_INFO);
         }
@@ -3000,6 +3029,7 @@ static bool add_line(String &buffer, char *line, size_t line_length,
       }
       buffer.length(0);
       *is_pl_escape_sql=0;
+      *is_pl_sql_type = 0;
     }
     else if (!*ml_comment &&
              (!*in_string &&
@@ -3051,6 +3081,8 @@ static bool add_line(String &buffer, char *line, size_t line_length,
           if (com_go(&buffer, 0) > 0)             // < 0 is not fatal
             DBUG_RETURN(1);
           buffer.length(0);
+          *is_pl_escape_sql = 0;
+          *is_pl_sql_type = 0;
         }
       }
       break;
@@ -3141,17 +3173,20 @@ static bool add_line(String &buffer, char *line, size_t line_length,
       buffer.realloc(buffer.length()+length+IO_SIZE);
     if ((!*ml_comment || preserve_comments) && buffer.append(line, length))
       DBUG_RETURN(1);
-    if (!buffer.is_empty()) {
-      String tmpbuf;
-      tmpbuf.append(buffer);
+    if (!buffer.is_empty() && !*is_pl_sql_type) {
+      char last_char = 0;
       if (add_n) {
-        char *p = tmpbuf.c_ptr();
-        p[tmpbuf.length()-1] = 0;
+        char *p = buffer.c_ptr();
+        last_char = p[buffer.length() - 1];
+        p[buffer.length() - 1] = 0;
       }
-      if (NULL!=(com = find_command(tmpbuf.c_ptr()))) {
-        if ((*com->func)(&tmpbuf, com->cmdstr) > 0)
+      if (NULL != (com = find_command(buffer.c_ptr()))) {
+        if ((*com->func)(&buffer, com->cmdstr) > 0)
           DBUG_RETURN(1);
         buffer.length(0);
+      } else if (add_n) {
+        char *p = buffer.c_ptr();
+        p[buffer.length() - 1] = last_char;
       }
     }
   }
@@ -3938,7 +3973,7 @@ com_go(String *buffer,char *line __attribute__((unused)))
     {
       if (!mysql_num_rows(result) && ! quick && !column_types_flag)
       {
-	strmov(buff, "Empty set");
+        strmov(buff, "Empty set");
         if (opt_xml)
         { 
           /*
@@ -3953,22 +3988,24 @@ com_go(String *buffer,char *line __attribute__((unused)))
       }
       else
       {
-	init_pager();
-	if (opt_html)
-	  print_table_data_html(result);
-	else if (opt_xml)
-	  print_table_data_xml(result);
+        init_pager();
+        if (opt_html)
+	        print_table_data_html(result);
+        else if (opt_xml)
+	        print_table_data_xml(result);
         else if (vertical || (auto_vertical_output &&
                 (terminal_width < get_result_width(result))))
-	  print_table_data_vertically(result);
-	else if (opt_silent && verbose <= 2 && !output_tables)
-	  print_tab_data(result);
-	else
-	  print_table_data(result);
-	snprintf(buff, sizeof(buff), "%ld %s in set",
-		(long) mysql_num_rows(result),
-		(long) mysql_num_rows(result) == 1 ? "row" : "rows");
-	end_pager();
+	        print_table_data_vertically(result);
+        else if (opt_silent && verbose <= 2 && !output_tables)
+	        print_tab_data(result);
+        else
+	        print_table_data(result);
+
+        snprintf(buff, sizeof(buff), "%ld %s in set",
+		      (long) mysql_num_rows(result),
+		      (long) mysql_num_rows(result) == 1 ? "row" : "rows");
+        end_pager();
+
         if (mysql_errno(&mysql))
           error= put_error(&mysql);
       }
@@ -3988,7 +4025,7 @@ com_go(String *buffer,char *line __attribute__((unused)))
       pos=int10_to_str(warnings, pos, 10);
       pos=strmov(pos, " warning");
       if (warnings != 1)
-	*pos++= 's';
+	      *pos++= 's';
     }
     strmov(pos, time_buff);
 
@@ -4047,18 +4084,22 @@ end:
 
 static void init_pager()
 {
-#ifdef USE_POPEN
-  if (!opt_nopager)
-  {
-    if (!(PAGER= popen(pager, "w")))
+  if (is_termout_oracle_enable(&mysql)) {
+  #ifdef USE_POPEN
+    if (!opt_nopager)
     {
-      tee_fprintf(stdout, "popen() failed! defaulting PAGER to stdout!\n");
-      PAGER= stdout;
+      if (!(PAGER= popen(pager, "w")))
+      {
+        tee_fprintf(stdout, "popen() failed! defaulting PAGER to stdout!\n");
+        PAGER= stdout;
+      }
     }
+    else
+  #endif
+      PAGER= stdout;
+  } else {
+    PAGER = NULL;
   }
-  else
-#endif
-    PAGER= stdout;
 }
 
 static void end_pager()
@@ -4084,6 +4125,7 @@ static void init_tee(const char *file_name)
   strmake_buf(outfile, file_name);
   tee_fprintf(stdout, "Logging to file '%s'\n", file_name);
   opt_outfile= 1;
+  is_in_tee = 1;
   return;
 }
 
@@ -4092,7 +4134,9 @@ static void end_tee()
 {
   my_fclose(OUTFILE, MYF(0));
   OUTFILE= 0;
+  memset(outfile, 0, sizeof(outfile));
   opt_outfile= 0;
+  is_in_tee = 0;
   return;
 }
 
@@ -4782,34 +4826,30 @@ print_table_data(MYSQL_RES *result)
   }
   separator.append('\0');                       // End marker for \0
 
-  if (is_termout_oracle_enable(&mysql)) {
-    tee_puts((char*)separator.ptr(), PAGER);
-    if (column_names)
+  tee_puts((char*)separator.ptr(), PAGER);
+  if (column_names)
+  {
+    mysql_field_seek(result, 0);
+    (void)tee_fputs("|", PAGER);
+    for (uint off = 0; (field = mysql_fetch_field(result)); off++)
     {
-      mysql_field_seek(result, 0);
-      (void)tee_fputs("|", PAGER);
-      for (uint off = 0; (field = mysql_fetch_field(result)); off++)
-      {
-        size_t name_length = (uint)strlen(field->name);
-        size_t numcells = charset_info->cset->numcells(charset_info,
-          field->name,
-          field->name + name_length);
-        size_t display_length = field->max_length + name_length - numcells;
-        tee_fprintf(PAGER, " %-*s |", (int)MY_MIN(display_length,
-          MAX_COLUMN_LENGTH),
-          field->name);
-      }
-      (void)tee_fputs("\n", PAGER);
-      tee_puts((char*)separator.ptr(), PAGER);
+      size_t name_length = (uint)strlen(field->name);
+      size_t numcells = charset_info->cset->numcells(charset_info,
+        field->name,
+        field->name + name_length);
+      size_t display_length = field->max_length + name_length - numcells;
+      tee_fprintf(PAGER, " %-*s |", (int)MY_MIN(display_length,
+        MAX_COLUMN_LENGTH),
+        field->name);
     }
+    (void)tee_fputs("\n", PAGER);
+    tee_puts((char*)separator.ptr(), PAGER);
   }
 
   while ((cur= mysql_fetch_row(result)))
   {
     if (interrupted_query)
       break;
-    if (!is_termout_oracle_enable(&mysql))
-      continue;
     
     ulong *lengths= mysql_fetch_lengths(result);
     (void) tee_fputs("| ", PAGER);
@@ -4886,9 +4926,7 @@ print_table_data(MYSQL_RES *result)
     }
     (void) tee_fputs("\n", PAGER);
   }
-  if (is_termout_oracle_enable(&mysql)) {
-    tee_puts((char*)separator.ptr(), PAGER);
-  }
+  tee_puts((char*)separator.ptr(), PAGER);
   my_afree((uchar*) num_flag);
 }
 
@@ -5298,25 +5336,20 @@ print_tab_data(MYSQL_RES *result)
   MYSQL_FIELD	*field;
   ulong		*lengths;
 
-  if (is_termout_oracle_enable(&mysql)) {
-    if (opt_silent < 2 && column_names)
+  if (opt_silent < 2 && column_names)
+  {
+    int first = 0;
+    while ((field = mysql_fetch_field(result)))
     {
-      int first = 0;
-      while ((field = mysql_fetch_field(result)))
-      {
-        if (first++)
-          (void)tee_fputs("\t", PAGER);
-        (void)tee_fputs(field->name, PAGER);
-      }
-      (void)tee_fputs("\n", PAGER);
+      if (first++)
+        (void)tee_fputs("\t", PAGER);
+      (void)tee_fputs(field->name, PAGER);
     }
+    (void)tee_fputs("\n", PAGER);
   }
   
   while ((cur = mysql_fetch_row(result)))
   {
-    if (!is_termout_oracle_enable(&mysql))
-      continue;
-
     lengths=mysql_fetch_lengths(result);
     field= mysql_fetch_fields(result);
     if (mysql.oracle_mode && is_binary_field_oracle(&field[0]))
@@ -5345,6 +5378,11 @@ com_tee(String *buffer __attribute__((unused)),
         char *line __attribute__((unused)))
 {
   char file_name[FN_REFLEN], *end, *param;
+  
+  if (is_in_spool) {
+    tee_fprintf(stdout, "Currently use spool to file '%s'\n", outfile);
+    return 0;
+  }
 
   //if (status.batch)
   //  return 0;
@@ -5389,6 +5427,10 @@ static int
 com_notee(String *buffer __attribute__((unused)),
 	  char *line __attribute__((unused)))
 {
+  if (is_in_spool) {
+    tee_fprintf(stdout, "Currently use spool to file '%s'\n", outfile);
+    return 0;
+  }
   if (opt_outfile)
     end_tee();
   tee_fprintf(stdout, "Outfile disabled.\n");
@@ -6476,6 +6518,7 @@ static int sql_real_connect_multi(const char* tns_name, ObClientLbAddressList *l
   ObClientLbAddress address;
   ObClientLbConfig config;
   String socket5_proxy;
+  my_bool close_attr_obclient_name = 1;
 
   memset(&config, 0, sizeof(config));
   memset(&address, 0, sizeof(address));
@@ -6547,7 +6590,9 @@ static int sql_real_connect_multi(const char* tns_name, ObClientLbAddressList *l
   //oracle proxy user
   if (ob_proxy_user_str && ob_proxy_user_str[0])
     config.mysql_ob_proxy_user = ob_proxy_user_str;
-
+  //close_attr_obclient_name
+  config.mysql_opt_close_attr_obclient_name = close_attr_obclient_name;
+  config.mysql_opt_close_attr_obclient_ip = opt_close_attr_obclient_ip;
 
   if (NULL != ob_mysql_real_connect(&mysql, tns_name, list, &config,
     user, password, database, NULL, connect_flag | CLIENT_MULTI_STATEMENTS, &address)) {
@@ -7001,9 +7046,11 @@ void tee_fprintf(FILE *file, const char *fmt, ...)
 {
   va_list args;
 
-  va_start(args, fmt);
-  (void) vfprintf(file, fmt, args);
-  va_end(args);
+  if (file) {
+    va_start(args, fmt);
+    (void)vfprintf(file, fmt, args);
+    va_end(args);
+  }
 
   if (opt_outfile)
   {
@@ -7016,7 +7063,9 @@ void tee_fprintf(FILE *file, const char *fmt, ...)
 
 void tee_fputs(const char *s, FILE *file)
 {
-  fputs(s, file);
+  if (file) {
+    fputs(s, file);
+  }
   if (opt_outfile)
     fputs(s, OUTFILE);
 }
@@ -7024,8 +7073,10 @@ void tee_fputs(const char *s, FILE *file)
 
 void tee_puts(const char *s, FILE *file)
 {
-  fputs(s, file);
-  fputc('\n', file);
+  if (file) {
+    fputs(s, file);
+    fputc('\n', file);
+  }
   if (opt_outfile)
   {
     fputs(s, OUTFILE);
@@ -7035,7 +7086,9 @@ void tee_puts(const char *s, FILE *file)
 
 void tee_putc(int c, FILE *file)
 {
-  putc(c, file);
+  if (file) {
+    putc(c, file);
+  }
   if (opt_outfile)
     putc(c, OUTFILE);
 }
@@ -7497,6 +7550,7 @@ static int is_cmd_line(char *pos, size_t len){
 }
 static my_bool is_termout_oracle_enable(MYSQL *mysql) {
   my_bool ret = 0;
+  //mysql return true
   if (!mysql->oracle_mode ||
     !(mysql->oracle_mode && in_com_source && !is_termout_oracle)) {
     ret = 1;
@@ -7516,8 +7570,7 @@ static int run_oracle_command(String *buffer, const char *line) {
   tmp.append(*buffer);
   tmp.append(line ? line : "", strlen(line ? line : ""));
 
-  e = tmp.c_ptr_safe() + tmp.length()-1;
-
+  e = tmp.c_ptr_safe() + tmp.length() - 1;
   p = get_trim_comment_sql(tmp.c_ptr_safe(), tmp.length());
   if (NULL == p) {
     return ret;
@@ -8366,6 +8419,178 @@ static bool execute_cmd(String &buffer) {
   } else {
     if (com_go(&buffer, 0) > 0)             // < 0 is not fatal
       return 1;
+  }
+  return 0;
+}
+
+
+static void end_spool()
+{
+  my_fclose(OUTFILE, MYF(0));
+  OUTFILE = 0;
+  memset(outfile, 0, sizeof(outfile));
+  opt_outfile = 0;
+  is_in_spool = 0;
+  return;
+}
+static void init_spool(const char *file_name, int flag)
+{
+  FILE* new_outfile;
+  if (opt_outfile)
+    end_spool();
+  if (!(new_outfile = my_fopen(file_name, flag, MYF(MY_WME))))
+  {
+    tee_fprintf(stdout, "Error logging to file '%s'\n", file_name);
+    return;
+  }
+  OUTFILE = new_outfile;
+  strmake_buf(outfile, file_name);
+  opt_outfile = 1;
+  is_in_spool = 1;
+  return;
+}
+
+
+
+static int com_spool(String *str, char* line)
+{
+  char param0[FN_REFLEN] = { 0 };
+  char param1[FN_REFLEN] = { 0 };
+  char param2[FN_REFLEN] = { 0 };
+  char *p = line;
+  char *s = NULL;
+  int paramlen = 0;
+  int paramlen1 = 0;
+  int paramlen2 = 0;
+  int i = 0;
+  my_bool isext = 0;
+  my_bool has_quot = 0;
+  int quot = 0;
+
+  if (is_in_tee) {
+    tee_fprintf(stdout, "Currently use tee to file '%s'\n", outfile);
+    return 0;
+  }
+  s = line;
+  JUMP_SPACE(p);
+  s = p;
+  while (*p != '\0' && !my_isspace(charset_info, *p))
+    p++;
+  paramlen = p - s;
+  memcpy(param0, s, paramlen);
+  if (!(strncasecmp("spool", s, paramlen) == 0 && paramlen >= 3)) {
+    return 0;
+  }
+
+  JUMP_SPACE(p);
+  s = p;
+  while (*p != '\0' && !my_isspace(charset_info, *p))
+    p++;
+  paramlen1 = p - s;
+  memcpy(param1, s, paramlen1);
+  if (paramlen1 == 0) {
+    if (is_in_spool) {
+      tee_fprintf(stdout, "currently spooling to %s\n", outfile);
+    } else {
+      tee_fprintf(stdout, "not spooling currently\n");
+    }
+    return 0;
+  } else if (paramlen1 == 2 && 
+    ((param1[0] == '\'' && param1[1] == '\'')|| (param1[0] == '"' && param1[1] == '"'))){
+    tee_fprintf(stdout, "SP2-0332: Cannot create spool file.\n");
+    return 0;
+  } else if (paramlen1 > 2 && 
+    ((param1[0] == '\'' && param1[paramlen1-1] == '\'') || (param1[0] == '"' && param1[paramlen1-1] == '"'))) {
+    memmove(param1, param1 + 1, paramlen1 - 1);
+    param1[paramlen1 - 2] = 0;
+    has_quot = 1;
+  }
+
+  JUMP_SPACE(p);
+  s = p;
+  while (*p != '\0' && !my_isspace(charset_info, *p))
+    p++;
+  paramlen2 = p - s;
+  memcpy(param2, s, paramlen2);
+
+  for (i = paramlen1-1; i >= 0; i--) {
+    if (param1[i] == '.' && i != paramlen1 - 1) {
+      isext = 1;
+    } else if (param1[i] == '\\' || param1[i] == '/') {
+      break;
+    }
+  }
+
+  if (paramlen1 > 0 && paramlen2 > 0) {
+    if (paramlen2 >= 3 && 0 == strncasecmp("create", param2, paramlen2)) {
+      if (opt_outfile) {
+        end_spool();
+      }
+      if (!isext) {
+#ifdef _WIN32
+        strcat(param1, ".LST");
+#else
+        strcat(param1, ".lst");
+#endif
+      }
+      if (access(param1, F_OK) == 0) {
+        tee_fprintf(stdout, "SP2 - 0771: The file \"%s\" already exists.\n", param1);
+        tee_fprintf(stdout, "Please use another name or \"SPOOL filename[.ext] REPLACE\"\n");
+      } else {
+        init_spool(param1, O_RDWR | O_TRUNC | O_CREAT);
+      }
+    } else if (paramlen2 >= 3 && 0 == strncasecmp("replace", param2, paramlen2)) {
+      if (opt_outfile) {
+        end_spool();
+      }
+      if (!isext) {
+#ifdef _WIN32
+        strcat(param1, ".LST");
+#else
+        strcat(param1, ".lst");
+#endif
+      }
+      init_spool(param1, O_RDWR | O_TRUNC | O_CREAT);
+    } else if (paramlen2 >= 3 && 0 == strncasecmp("append", param2, paramlen2)) {
+      if (opt_outfile) {
+        end_spool();
+      }
+      if (!isext) {
+#ifdef _WIN32
+        strcat(param1, ".LST");
+#else
+        strcat(param1, ".lst");
+#endif
+      }
+      init_spool(param1, O_APPEND | O_WRONLY);
+    } else {
+      tee_fprintf(stdout, "use: SPOOL{ <file> | OFF | OUT }\n");
+      tee_fprintf(stdout, " <file> is file_name[.ext][CRE[ATE] | REP[LACE] | APP[END]]\n");
+    }
+  } else if (paramlen1 > 0 && paramlen2 == 0) {
+    if (paramlen1 == 3 && 0 == strncasecmp("off", param1, paramlen1) && !has_quot) {
+      if (opt_outfile) {
+        end_spool();
+      } else {
+        tee_fprintf(stdout, "not spooling currently\n");
+      }
+    } else if (paramlen1 == 3 && 0 == strncasecmp("out", param1, paramlen1) && !has_quot) {
+      if (opt_outfile) {
+        end_spool();
+        tee_fprintf(stdout, "not supprt print\n");
+      } else {
+        tee_fprintf(stdout, "not spooling currently\n");
+      }
+    } else {
+      if (!isext) {
+#ifdef _WIN32
+        strcat(param1, ".LST");
+#else
+        strcat(param1, ".lst");
+#endif
+      }
+      init_spool(param1, O_RDWR | O_TRUNC | O_CREAT);
+    }
   }
   return 0;
 }

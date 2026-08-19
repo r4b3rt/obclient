@@ -1,0 +1,8 @@
+[target]
+os=8
+arch=x86_64
+repo=https://mirrors.aliyun.com/oceanbase/development-kit/al/8/x86_64/
+
+[deps]
+devdeps-openssl-static-1.1.1u-132024092718.al8.x86_64.rpm
+devdeps-ncurses-static-6.2-112024092810.al8.x86_64.rpm
