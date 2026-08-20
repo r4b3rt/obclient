@@ -110,6 +110,8 @@ enum options_client
   OPT_OB_PROXY_USER,
   OPT_OB_SOCKET5_PROXY,
   OPT_OB_ERROR_SQL,
+  OPT_OB_CLOSE_OBCLIENT_IP,
+  OPT_OB_CLOSE_OBCLIENT_NAME,
   OPT_MAX_CLIENT_OPTION /* should be always the last */
 };
 

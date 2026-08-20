@@ -11,6 +11,7 @@ clean
 
 TOP_DIR=$(cd "$(dirname "$0")";pwd)
 DEP_DIR=${TOP_DIR}/deps/3rd/usr/local/oceanbase/deps/devel
+ID=`grep '^ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"'`
 
 # Download and extract third-party dependencies
 echo "=== Downloading dependencies ==="
@@ -18,6 +19,10 @@ echo "=== Downloading dependencies ==="
 if [[ $? -ne 0 ]]; then
   echo "Failed to download dependencies" 1>&2
   exit 1
+fi
+
+if [ "${ID}" = "alinux" ]; then
+  CURSES_TINFO_LIBRARY=$DEP_DIR/lib/libtinfo.a
 fi
 
 # Common cmake options (shared between platforms)
@@ -66,6 +71,7 @@ else
     -DCURSES_LIBRARY=$DEP_DIR/lib/libcurses.a
     -DCURSES_NCURSES_LIBRARY=$DEP_DIR/lib/libncurses.a
     -DCURSES_FORM_LIBRARY=$DEP_DIR/lib/libform.a
+    -DCURSES_TINFO_LIBRARY=$CURSES_TINFO_LIBRARY
   )
 fi
 

@@ -6655,6 +6655,7 @@ void safe_connect(MYSQL* mysql, const char *name, const char *host,
                   int port, const char *sock)
 {
   int failed_attempts= 0;
+  my_bool close_attr_obclient_name = 1;
 
   DBUG_ENTER("safe_connect");
 
@@ -6665,6 +6666,8 @@ void safe_connect(MYSQL* mysql, const char *name, const char *host,
   mysql_options(mysql, MYSQL_OPT_CONNECT_ATTR_RESET, 0);
   mysql_options4(mysql, MYSQL_OPT_CONNECT_ATTR_ADD,
                  "program_name", "mysqltest");
+  //close_attr_obclient_name
+  mysql_options(mysql, OB_OPT_CLOSE_ATTR_OBCLIENT_NAME, &close_attr_obclient_name);
   while(!mysql_real_connect(mysql, host,user, pass, db, port, sock,
                             CLIENT_MULTI_STATEMENTS | CLIENT_REMEMBER_OPTIONS))
   {
@@ -6731,6 +6734,7 @@ int connect_n_handle_errors(struct st_command *command,
 {
   DYNAMIC_STRING *ds;
   int failed_attempts= 0;
+  my_bool close_attr_obclient_name = 1;
 
   ds= &ds_res;
 
@@ -6768,6 +6772,8 @@ int connect_n_handle_errors(struct st_command *command,
 
   mysql_options(con, MYSQL_OPT_CONNECT_ATTR_RESET, 0);
   mysql_options4(con, MYSQL_OPT_CONNECT_ATTR_ADD, "program_name", "mysqltest");
+  //close_attr_obclient_name
+  mysql_options(con, OB_OPT_CLOSE_ATTR_OBCLIENT_NAME, &close_attr_obclient_name);
   while (!mysql_real_connect(con, host, user, pass, db, port, sock ? sock: 0,
                           CLIENT_MULTI_STATEMENTS))
   {
